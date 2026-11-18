@@ -39,6 +39,7 @@
   .pill.running { background:#1d3a5f; color:#9cc2ff; }
   .pill.paused,.pill.preparing { background:#4a3a12; color:var(--warn); }
   .pill.completed { background:#13402d; color:var(--ok); }
+  .pill.early_stopped { background:#3d2a52; color:#c9a7ff; }
   .pill.idle { background:#2a3550; color:var(--muted); }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
          margin-right:6px; }
@@ -74,16 +75,29 @@
   <section>
     <div class="card">
       <h2>1 · 新建训练任务（单任务）</h2>
-      <label>CSV 文件（列：x1, x2, label∈{0,1}；2～200 行，可含表头）</label>
+      <label>训练 CSV（列：x1, x2, label∈{0,1}；2～200 行，可含表头）</label>
       <input type="file" id="csv" accept=".csv,text/csv">
-      <label>训练轮数（1～100）</label>
-      <input type="number" id="rounds" value="20" min="1" max="100">
+      <label>独立验证 CSV（可选；与训练集同列 x1,x2,label；2～200 行；不参与梯度）</label>
+      <input type="file" id="valcsv" accept=".csv,text/csv">
+      <div class="grid2">
+        <div>
+          <label>训练轮数（1～100）</label>
+          <input type="number" id="rounds" value="20" min="1" max="100">
+        </div>
+        <div>
+          <label>连续无改善轮数 patience（1～10）</label>
+          <input type="number" id="patience" value="3" min="1" max="10">
+        </div>
+      </div>
+      <label>非负最小改善量 min_delta（相对最佳损失的降幅须严格大于该值才算改善）</label>
+      <input type="number" id="min_delta" value="0" min="0" step="0.0001">
       <div class="row" style="margin-top:12px">
         <button id="btnUpload">上传并建组</button>
         <button class="ghost" id="btnReset">清除当前任务</button>
       </div>
       <div class="err" id="uploadErr"></div>
-      <div class="hint">两进程分片互斥：worker1 取前 ⌈n/2⌉ 行，worker2 取其余行。</div>
+      <div class="hint">两进程训练分片互斥：worker1 取前 ⌈n/2⌉ 行，worker2 取其余行。
+        验证 CSV 以同样方式切成互斥验证分片，仅用于评估，绝不参与梯度。</div>
     </div>
 
     <div class="card" style="margin-top:18px">
@@ -92,10 +106,14 @@
         <button id="btnStart">开始</button>
         <button class="warn" id="btnResume">故障后恢复（Resume）</button>
         <button class="ghost" id="btnPause">暂停</button>
-        <button class="ghost" id="btnWeights">下载已确认权重</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" id="btnWeights">下载已确认权重（最后已确认轮）</button>
+        <button class="ghost" id="btnBest">下载最佳轮完整权重+动量</button>
       </div>
       <div class="hint">任一进程退出，整组自动暂停；恢复会开启新一代（generation），
-        两侧回滚到最后已确认轮后重做未确认轮，绝不跳轮、不重复应用。</div>
+        两侧回滚到最后已确认轮后重做未确认轮，绝不跳轮、不重复应用。
+        若某轮已确认但验证中途失败，恢复会先补完该轮验证再决定是否进入下一轮。</div>
     </div>
 
     <div class="card" style="margin-top:18px">
@@ -121,8 +139,12 @@
         <div class="k">任务状态</div><div><span class="pill idle" id="st">—</span></div>
         <div class="k">训练代 generation</div><div id="gen">—</div>
         <div class="k">已确认轮次</div><div id="confirmed">—</div>
-        <div class="k">最新损失（全数据 BCE）</div><div id="loss">—</div>
-        <div class="k">进行中轮次</div><div id="running">—</div>
+        <div class="k">最新训练损失（全数据 BCE）</div><div id="loss">—</div>
+        <div class="k">进行中轮次 / 阶段</div><div id="running">—</div>
+        <div class="k">独立验证集</div><div id="valmeta">—</div>
+        <div class="k">已验证轮次</div><div id="valeval">—</div>
+        <div class="k">最佳验证轮 / 损失</div><div id="bestval">—</div>
+        <div class="k">连续无改善</div><div id="noimprove">—</div>
         <div class="k">最近事件</div><div id="event">—</div>
         <div class="k">错误</div><div class="err" id="err" style="margin:0"></div>
       </div>
@@ -144,11 +166,23 @@
     </div>
 
     <div class="card" style="margin-top:18px">
+      <h2>验证损失曲线（独立验证 CSV，按样本数合并两侧分片损失）</h2>
+      <canvas id="valchart" width="900" height="220"></canvas>
+    </div>
+
+    <div class="card" style="margin-top:18px">
       <h2>轮次记录 / 事件日志</h2>
-      <div style="max-height:210px; overflow:auto; margin-bottom:12px">
-        <table id="lossTable"><thead><tr>
-          <th>轮次</th><th>损失 BCE</th><th>时间戳</th>
-        </tr></thead><tbody></tbody></table>
+      <div class="grid2">
+        <div style="max-height:210px; overflow:auto; margin-bottom:12px">
+          <table id="lossTable"><thead><tr>
+            <th>训练轮</th><th>训练 BCE</th><th>时间</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+        <div style="max-height:210px; overflow:auto; margin-bottom:12px">
+          <table id="valTable"><thead><tr>
+            <th>验证轮</th><th>验证 BCE</th><th>时间</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
       </div>
       <div class="log" id="log"></div>
     </div>
@@ -178,17 +212,31 @@ function ts(ms){ return new Date(ms).toLocaleTimeString(); }
 
 async function upload() {
   const f = $("csv").files[0];
-  if (!f) { $("uploadErr").textContent = "请先选择 CSV 文件"; return; }
+  if (!f) { $("uploadErr").textContent = "请先选择训练 CSV 文件"; return; }
   const rounds = parseInt($("rounds").value, 10);
   if (!(rounds>=1 && rounds<=100)) {
-    $("uploadErr").textContent = "轮数必须在 1～100"; return;
+    $("uploadErr").textContent = "训练轮数必须在 1～100"; return;
   }
-  const fd = new FormData(); fd.append("file", f);
+  const patience = parseInt($("patience").value, 10);
+  if (!(patience>=1 && patience<=10)) {
+    $("uploadErr").textContent = "连续无改善轮数必须在 1～10"; return;
+  }
+  const minDelta = parseFloat($("min_delta").value);
+  if (!Number.isFinite(minDelta) || minDelta < 0) {
+    $("uploadErr").textContent = "最小改善量必须是非负有限数"; return;
+  }
+  const fd = new FormData();
+  fd.append("file", f);
+  const vf = $("valcsv").files[0];
+  if (vf) fd.append("val_file", vf);
+  const q = `rounds=${rounds}&patience=${patience}&min_delta=${minDelta}`;
   try {
     $("uploadErr").textContent = "上传中…";
-    const d = await api(`/api/job?rounds=${rounds}`, {method:"POST", body:fd});
+    const d = await api(`/api/job?${q}`, {method:"POST", body:fd});
     $("uploadErr").textContent = "";
-    pushLog(`任务已创建：n=${d.total_rounds ? "" : ""} task=${d.task_id.slice(0,8)} 轮数=${d.total_rounds}`);
+    pushLog(`任务已创建：task=${d.task_id.slice(0,8)} 轮数=${d.total_rounds}`
+      + (d.validation_enabled ? ` 验证样本=${d.val_n||""} patience=${patience} min_delta=${minDelta}`
+                              : "（未提供验证 CSV，纯训练模式）"));
   } catch(e) { $("uploadErr").textContent = e.message; }
 }
 
@@ -201,21 +249,23 @@ function workerBox(slot, h) {
        <div class="k">持有任务</div><div>${(h.task_id||"—").slice(0,8)||"—"}</div>
        <div class="k">当前 generation</div><div>${h.gen??"—"}</div>
        <div class="k">已持久化轮次</div><div>${h.round}</div>
+       <div class="k">验证分片样本</div><div>${h.val_n ?? 0}</div>
        <div class="k">注入延迟</div><div>${h.delay_seconds}s</div>
        <div class="k">进程存活时长</div><div>${h.uptime}s</div>`
     : `<div class="k">状态</div><div class="err" style="margin:0">${
         (h&&h.error)?h.error.slice(0,80):"进程未响应"}</div>`;
 }
 
-function drawChart(history) {
-  const c = $("chart"), ctx = c.getContext("2d");
+function drawLine(canvasId, points, emptyMsg, color="#5b8cff",
+                  dotColor="#9cc2ff") {
+  const c = $(canvasId), ctx = c.getContext("2d");
   const W=c.width, H=c.height, pad=42;
   ctx.clearRect(0,0,W,H);
-  if (!history || history.length < 2) {
+  if (!points || points.length < 1) {
     ctx.fillStyle="#5c6b88"; ctx.font="13px sans-serif";
-    ctx.fillText("等待已确认轮次数据…", pad, H/2); return;
+    ctx.fillText(emptyMsg, pad, H/2); return;
   }
-  const xs = history.map(h=>h.round), ys = history.map(h=>h.loss);
+  const xs = points.map(p=>p.x), ys = points.map(p=>p.y);
   const xmin=Math.min(...xs), xmax=Math.max(...xs);
   const ymin=Math.min(...ys), ymax=Math.max(...ys);
   const X=x => pad + (x-xmin)/Math.max(1,xmax-xmin)*(W-pad*1.4);
@@ -227,13 +277,25 @@ function drawChart(history) {
   ctx.fillText(fmt(ymax,4), 4, 16); ctx.fillText(fmt(ymin,4), 4, H-pad);
   ctx.fillText(String(xmin), pad-4, H-pad+16);
   ctx.fillText(String(xmax), W-pad*0.4-10, H-pad+16);
-  ctx.strokeStyle="#5b8cff"; ctx.lineWidth=2; ctx.beginPath();
-  history.forEach((h,i)=>{ i?ctx.lineTo(X(h.round),Y(h.loss))
-                              :ctx.moveTo(X(h.round),Y(h.loss)); });
+  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+  points.forEach((p,i)=>{ i?ctx.lineTo(X(p.x),Y(p.y))
+                              :ctx.moveTo(X(p.x),Y(p.y)); });
   ctx.stroke();
-  ctx.fillStyle="#9cc2ff";
-  history.forEach(h=>{ ctx.beginPath();
-    ctx.arc(X(h.round),Y(h.loss),3,0,Math.PI*2); ctx.fill(); });
+  ctx.fillStyle=dotColor;
+  points.forEach(p=>{ ctx.beginPath();
+    ctx.arc(X(p.x),Y(p.y),3,0,Math.PI*2); ctx.fill(); });
+}
+
+function drawChart(history) {
+  drawLine("chart",
+    (history||[]).map(h=>({x:h.round, y:h.loss})),
+    "等待已确认轮次数据…");
+}
+
+function drawValChart(valHistory) {
+  drawLine("valchart",
+    (valHistory||[]).map(h=>({x:h.round, y:h.val_loss})),
+    "未配置验证 CSV 或尚无已评估轮次…", "#35c48b", "#8ff0cf");
 }
 
 function render(d) {
@@ -244,15 +306,40 @@ function render(d) {
     `${d.confirmed_round ?? "—"} / ${d.total_rounds ?? "—"}`;
   const last = (d.loss_history||[]).slice(-1)[0];
   $("loss").textContent = last ? fmt(last.loss) : "—";
-  $("running").textContent = d.running_round ?? "—";
+  $("running").textContent = d.running_round
+    ? `${d.running_round}${d.stage ? "（"+d.stage+"）" : ""}`
+    : (d.stage || "—");
   $("event").textContent = d.last_event ?? "—";
   $("err").textContent = d.last_error ?? "";
+  // Validation overview.
+  if (d.validation_enabled) {
+    $("valmeta").textContent =
+      `${d.val_n} 行 · patience=${d.patience} · min_delta=${fmt(d.min_delta ?? 0)}`;
+    $("valeval").textContent =
+      `${d.val_evaluated_round ?? 0} / ${d.total_rounds ?? "—"}`;
+    $("bestval").textContent = (d.best_val_round == null)
+      ? "—（尚未产生已评估轮）"
+      : `第 ${d.best_val_round} 轮 · ${fmt(d.best_val_loss)}`;
+    $("noimprove").textContent =
+      `${d.no_improve_rounds ?? 0} / ${d.patience ?? "—"}`;
+  } else {
+    $("valmeta").textContent = "未配置（纯训练模式）";
+    $("valeval").textContent = "—";
+    $("bestval").textContent = "—";
+    $("noimprove").textContent = "—";
+  }
+  $("btnBest").disabled = !d.best_weights_available;
   workerBox("w1", d.workers && d.workers.worker1);
   workerBox("w2", d.workers && d.workers.worker2);
   drawChart(d.loss_history);
+  drawValChart(d.val_history);
   const tb = $("lossTable").querySelector("tbody");
   tb.innerHTML = (d.loss_history||[]).map(h =>
     `<tr><td>${h.round}</td><td>${fmt(h.loss)}</td><td>${ts(h.at)}</td></tr>`
+  ).join("");
+  const vtb = $("valTable").querySelector("tbody");
+  vtb.innerHTML = (d.val_history||[]).map(h =>
+    `<tr><td>${h.round}</td><td>${fmt(h.val_loss)}</td><td>${ts(h.at)}</td></tr>`
   ).join("");
   if (d.last_event && d.last_event !== lastEvent) {
     pushLog(`[${st}] ${d.last_event}`);
@@ -287,6 +374,7 @@ $("btnReset").onclick = async()=>{
   try{ await post("/api/reset"); location.reload(); }
   catch(e){ pushLog("重置失败: "+e.message); } };
 $("btnWeights").onclick = ()=>{ window.location = "/api/weights"; };
+$("btnBest").onclick = ()=>{ window.location = "/api/best_weights"; };
 $("btnDelay").onclick = async()=>{
   const s = parseFloat($("delay").value)||0;
   try{ await post("/api/workers/delay", {seconds:s});

@@ -1,6 +1,7 @@
 """Determinism and math-equivalence unit tests for the shared LR library."""
 
 import numpy as np
+import pytest
 
 from app import lrmath as lr
 
@@ -80,3 +81,22 @@ def test_bit_identical_repeat_runs():
 def test_sigmoid_stable_at_extremes():
     p = lr.sigmoid(np.array([-1000.0, 0.0, 1000.0]))
     assert p[0] == 0.0 and p[1] == 0.5 and p[2] == 1.0
+
+
+def test_shard_loss_sums_merge_by_sample_count():
+    x, y = _toy_dataset()
+    x_aug = lr.augment(x)
+    w = np.array([0.05, -0.15, 0.25])
+    cut = (len(y) + 1) // 2
+    s1 = lr.bce_loss_sum(x_aug[:cut], y[:cut], w)
+    s2 = lr.bce_loss_sum(x_aug[cut:], y[cut:], w)
+    merged = (s1 + s2) / len(y)
+    # Sample-count merge of exclusive shards equals the full-set mean BCE.
+    assert merged == pytest.approx(lr.bce_loss(x_aug, y, w), rel=1e-12)
+    # The merge is a plain weighted-by-count combination, not an average of
+    # shard means (which would be wrong on unequal shard sizes).
+    shard_means = (lr.bce_loss(x_aug[:cut], y[:cut], w),
+                   lr.bce_loss(x_aug[cut:], y[cut:], w))
+    naive_mean = sum(shard_means) / 2
+    if cut != len(y) - cut:
+        assert merged != pytest.approx(naive_mean, rel=1e-12)

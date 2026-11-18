@@ -66,6 +66,20 @@ def bce_loss(x_aug: np.ndarray, y: np.ndarray, w: Sequence[float]) -> float:
     return float(total / x_aug.shape[0])
 
 
+def bce_loss_sum(x_aug: np.ndarray, y: np.ndarray, w: Sequence[float]) -> float:
+    """Sum (not mean) of per-sample binary cross-entropy over a shard.
+
+    The validation protocol merges the two mutually-exclusive validation
+    shards by *sample count*: the coordinator adds the two shard sums and
+    divides once by the total validation sample count, which is exactly the
+    full-validation-set mean BCE in canonical row order.
+    """
+    p = probabilities(x_aug, w)
+    p = np.clip(p, 1e-300, 1.0 - 1e-300)
+    total = -np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+    return float(total)
+
+
 def shard_residuals(
     x_aug: np.ndarray, y: np.ndarray, w: Sequence[float]
 ) -> Tuple[np.ndarray, float]:

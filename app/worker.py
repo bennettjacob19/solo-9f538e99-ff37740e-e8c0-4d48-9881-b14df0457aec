@@ -3,8 +3,9 @@
 Each worker is deployed as its own container with its own persistent volume
 mounted at ``WORKER_DATA`` (default ``/data``). Durable files:
 
-* ``shard.json``  - the exclusive sample shard assigned to this worker
-* ``state.json``  - highest persisted ``{round, weights, momentum}``
+* ``shard.json``     - the exclusive training shard assigned to this worker
+* ``val_shard.json`` - the exclusive validation shard (never used for gradients)
+* ``state.json``     - highest persisted ``{round, weights, momentum}``
 
 Fencing
 -------
@@ -40,6 +41,7 @@ from storage import atomic_write_json, if_exists_read_json
 WORKER_ID = os.environ.get("WORKER_ID", "worker")
 DATA_DIR = os.environ.get("WORKER_DATA", "/data")
 SHARD_PATH = os.path.join(DATA_DIR, "shard.json")
+VAL_SHARD_PATH = os.path.join(DATA_DIR, "val_shard.json")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
 app = FastAPI(title=f"lr-worker-{WORKER_ID}")
@@ -54,6 +56,9 @@ class WorkerState:
         self.v: np.ndarray = lrmath.zero_buffers()
         self.x_aug: Optional[np.ndarray] = None
         self.y: Optional[np.ndarray] = None
+        # Exclusive validation shard: evaluation only, never feeds a gradient.
+        self.val_x_aug: Optional[np.ndarray] = None
+        self.val_y: Optional[np.ndarray] = None
         self.delay_seconds: float = 0.0
         self.started_at: float = time.time()
         self._load_durable()
@@ -64,6 +69,10 @@ class WorkerState:
         if shard:
             self.task_id = shard["task_id"]
             self._install_shard(shard["rows"])
+        val_shard = if_exists_read_json(VAL_SHARD_PATH)
+        if val_shard:
+            self.task_id = val_shard["task_id"]
+            self._install_val_shard(val_shard["rows"])
         state = if_exists_read_json(STATE_PATH)
         if state:
             # A persisted state always belongs to the shard's task.
@@ -77,6 +86,11 @@ class WorkerState:
         xs = np.asarray([r["x"] for r in rows], dtype=np.float64)
         self.x_aug = lrmath.augment(xs)
         self.y = np.asarray([r["y"] for r in rows], dtype=np.float64)
+
+    def _install_val_shard(self, rows: list) -> None:
+        xs = np.asarray([r["x"] for r in rows], dtype=np.float64)
+        self.val_x_aug = lrmath.augment(xs)
+        self.val_y = np.asarray([r["y"] for r in rows], dtype=np.float64)
 
     # ------------------------------------------------------------------ guards
     def check_fence(self, task_id: str, gen: int) -> None:
@@ -103,6 +117,7 @@ class WorkerState:
         # New task (or re-creation): wipe all previous durable state.
         self.task_id = task_id
         self._install_shard(rows)
+        self.val_x_aug, self.val_y = None, None
         self.round = 0
         self.w = lrmath.zero_buffers()
         self.v = lrmath.zero_buffers()
@@ -111,10 +126,59 @@ class WorkerState:
             "task_id": task_id, "worker_id": WORKER_ID,
             "rows": rows, "n": len(rows),
         })
+        try:
+            os.unlink(VAL_SHARD_PATH)
+        except FileNotFoundError:
+            pass
         atomic_write_json(STATE_PATH, {
             "task_id": task_id, "gen": None, "round": 0,
             "w": lrmath.to_list(self.w), "v": lrmath.to_list(self.v),
         })
+
+    def load_validation(self, task_id: str, worker_id: str,
+                        rows: list) -> Dict[str, Any]:
+        if worker_id != WORKER_ID:
+            raise HTTPException(status_code=400,
+                                detail=f"this worker is {WORKER_ID}")
+        if self.task_id != task_id:
+            raise HTTPException(status_code=410,
+                                detail="task id mismatch: load training shard "
+                                       "before the validation shard")
+        self._install_val_shard(rows)
+        atomic_write_json(VAL_SHARD_PATH, {
+            "task_id": task_id, "worker_id": WORKER_ID,
+            "rows": rows, "n": len(rows),
+        })
+        return {"worker_id": WORKER_ID, "task_id": task_id,
+                "val_n": len(rows)}
+
+    def validate(self, task_id: str, gen: int, round_: int,
+                 w: list) -> Dict[str, Any]:
+        self.check_fence(task_id, gen)
+        if self.val_x_aug is None:
+            raise HTTPException(status_code=410,
+                                detail="worker holds no validation shard")
+        # Evaluation is only valid for the round this worker itself has
+        # durably committed, and only with exactly those confirmed weights.
+        # This guarantees an unevaluated/unknown round can never be labelled
+        # best with mismatched weights.
+        if round_ != self.round:
+            raise HTTPException(
+                status_code=409,
+                detail=f"validation round mismatch: worker at round "
+                       f"{self.round}, asked to evaluate {round_}")
+        w_arr = np.asarray(w, dtype=np.float64)
+        if not np.array_equal(w_arr, self.w):
+            raise HTTPException(
+                status_code=409,
+                detail="validation weights differ from this worker's "
+                       "durable confirmed weights")
+        n = int(self.val_x_aug.shape[0])
+        loss_sum = lrmath.bce_loss_sum(self.val_x_aug, self.val_y, self.w)
+        return {
+            "worker_id": WORKER_ID, "task_id": task_id, "gen": gen,
+            "round": round_, "n": n, "loss_sum": loss_sum,
+        }
 
     def prepare(self, task_id: str, gen: int, round_: int,
                 w: list, v: list) -> Dict[str, Any]:
@@ -203,6 +267,12 @@ class LoadIn(BaseModel):
     rows: list = Field(..., min_length=1)
 
 
+class LoadValIn(BaseModel):
+    task_id: str
+    worker_id: str
+    rows: list = Field(..., min_length=1)
+
+
 class PrepareIn(BaseModel):
     task_id: str
     gen: int
@@ -224,6 +294,13 @@ class CommitIn(BaseModel):
     grad: list
 
 
+class ValidateIn(BaseModel):
+    task_id: str
+    gen: int
+    round: int
+    w: list
+
+
 class DelayIn(BaseModel):
     seconds: float = Field(..., ge=0, le=120)
 
@@ -235,6 +312,8 @@ async def health() -> Dict[str, Any]:
         "worker_id": WORKER_ID, "alive": True,
         "task_id": STATE.task_id, "gen": STATE.gen,
         "round": STATE.round, "durable_round": STATE.round,
+        "val_n": int(STATE.val_x_aug.shape[0])
+        if STATE.val_x_aug is not None else 0,
         "delay_seconds": STATE.delay_seconds,
         "uptime": round(time.time() - STATE.started_at, 3),
         "pid": os.getpid(),
@@ -246,6 +325,11 @@ async def load(body: LoadIn) -> Dict[str, Any]:
     STATE.load_task(body.task_id, body.worker_id, body.rows)
     return {"worker_id": WORKER_ID, "task_id": STATE.task_id,
             "n": STATE.x_aug.shape[0], "round": STATE.round}
+
+
+@app.post("/load_val")
+async def load_val(body: LoadValIn) -> Dict[str, Any]:
+    return STATE.load_validation(body.task_id, body.worker_id, body.rows)
 
 
 @app.post("/prepare")
@@ -264,6 +348,12 @@ async def gradient(body: GradIn) -> Dict[str, Any]:
 async def commit(body: CommitIn) -> Dict[str, Any]:
     await STATE.inject_delay()
     return STATE.commit(body.task_id, body.gen, body.round, body.grad)
+
+
+@app.post("/validate")
+async def validate(body: ValidateIn) -> Dict[str, Any]:
+    await STATE.inject_delay()
+    return STATE.validate(body.task_id, body.gen, body.round, body.w)
 
 
 @app.post("/delay")
