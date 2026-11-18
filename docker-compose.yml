@@ -1,0 +1,81 @@
+# Three processes on an isolated bridge network:
+#   coordinator  - FastAPI web UI + orchestration + durable confirmation
+#   worker1/2    - independent CPU processes, each with its OWN persistent
+#                  volume (they never share state or data shards)
+#
+# Quick start:
+#   docker compose up --build
+#   open http://localhost:8000
+#
+# Failure drills:
+#   docker compose kill worker1            # hard kill (container restarts)
+#   docker compose restart coordinator     # coordinator reboot mid-round
+#   docker compose down && docker compose up   # full cluster reboot, volumes kept
+
+services:
+  coordinator:
+    build: .
+    image: lr-fault-tolerant-trainer:latest
+    entrypoint: ["/app/entrypoint-coordinator.sh"]
+    environment:
+      COORD_DATA: /data
+      WORKER1_URL: http://worker1:8000
+      WORKER2_URL: http://worker2:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - coord_data:/data
+    depends_on:
+      worker1:
+        condition: service_started
+      worker2:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/status', timeout=4).status==200 else 1)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 8s
+
+  worker1:
+    image: lr-fault-tolerant-trainer:latest
+    build: .
+    entrypoint: ["/app/entrypoint-worker.sh"]
+    environment:
+      WORKER_ID: worker1
+      WORKER_DATA: /data
+    volumes:
+      - worker1_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"]
+      interval: 8s
+      timeout: 5s
+      retries: 6
+      start_period: 4s
+
+  worker2:
+    image: lr-fault-tolerant-trainer:latest
+    build: .
+    entrypoint: ["/app/entrypoint-worker.sh"]
+    environment:
+      WORKER_ID: worker2
+      WORKER_DATA: /data
+    volumes:
+      - worker2_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status==200 else 1)"]
+      interval: 8s
+      timeout: 5s
+      retries: 6
+      start_period: 4s
+
+volumes:
+  coord_data:
+  worker1_data:
+  worker2_data:

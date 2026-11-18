@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>容错逻辑回归训练台 · 双 CPU 进程</title>
+<style>
+  :root { --bg:#0f1420; --card:#182031; --line:#2a3550; --fg:#e6ebf5;
+          --muted:#8fa0bd; --ok:#35c48b; --warn:#f0b429; --bad:#ef5d6a;
+          --accent:#5b8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC",
+         "Microsoft YaHei",sans-serif; }
+  header { padding:18px 26px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:12px; }
+  main { padding:22px 26px; display:grid; gap:18px;
+         grid-template-columns: 380px 1fr; }
+  @media (max-width: 980px){ main{ grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:16px 18px; }
+  .card h2 { font-size:14px; margin:0 0 12px; color:var(--muted);
+             text-transform:uppercase; letter-spacing:.06em; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px;}
+  input[type=file],input[type=number],select {
+    width:100%; background:#0f1626; border:1px solid var(--line);
+    color:var(--fg); border-radius:8px; padding:9px 10px; font-size:13px; }
+  button { border:0; border-radius:8px; padding:9px 14px; font-size:13px;
+           cursor:pointer; color:#fff; background:var(--accent); margin:6px 6px 0 0;}
+  button.ghost { background:#28344d; }
+  button.danger { background:var(--bad); }
+  button.warn { background:#a9741a; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px;
+          font-size:12px; font-weight:600; }
+  .pill.running { background:#1d3a5f; color:#9cc2ff; }
+  .pill.paused,.pill.preparing { background:#4a3a12; color:var(--warn); }
+  .pill.completed { background:#13402d; color:var(--ok); }
+  .pill.idle { background:#2a3550; color:var(--muted); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+         margin-right:6px; }
+  .dot.up { background:var(--ok); } .dot.down { background:var(--bad); }
+  .kv { display:grid; grid-template-columns: 130px 1fr; gap:6px 10px;
+        font-size:13px; }
+  .kv .k { color:var(--muted); }
+  .worker { border:1px solid var(--line); border-radius:10px; padding:12px;
+            margin-top:10px; background:#121a2b; }
+  .worker h3 { margin:0 0 8px; font-size:13px; display:flex;
+               justify-content:space-between; align-items:center; }
+  .log { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+         background:#0c1220; border:1px solid var(--line); border-radius:8px;
+         padding:10px; height:170px; overflow:auto; white-space:pre-wrap;
+         color:#b8c6e0; }
+  canvas { width:100%; height:240px; background:#0c1220; border-radius:8px;
+           border:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th,td { border-bottom:1px solid var(--line); padding:5px 7px; text-align:right;}
+  th:first-child,td:first-child{ text-align:left; color:var(--muted);}
+  .err { color:var(--bad); font-size:12px; margin-top:8px; min-height:16px;}
+  .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>缺陷分类器 · 容错分布式训练台</h1>
+  <span>逻辑回归 · 双独立 CPU 进程 · 全数据平均梯度 · 动量 SGD（lr=0.1, momentum=0.9，零初始化）</span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>1 · 新建训练任务（单任务）</h2>
+      <label>CSV 文件（列：x1, x2, label∈{0,1}；2～200 行，可含表头）</label>
+      <input type="file" id="csv" accept=".csv,text/csv">
+      <label>训练轮数（1～100）</label>
+      <input type="number" id="rounds" value="20" min="1" max="100">
+      <div class="row" style="margin-top:12px">
+        <button id="btnUpload">上传并建组</button>
+        <button class="ghost" id="btnReset">清除当前任务</button>
+      </div>
+      <div class="err" id="uploadErr"></div>
+      <div class="hint">两进程分片互斥：worker1 取前 ⌈n/2⌉ 行，worker2 取其余行。</div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>2 · 训练控制</h2>
+      <div class="row">
+        <button id="btnStart">开始</button>
+        <button class="warn" id="btnResume">故障后恢复（Resume）</button>
+        <button class="ghost" id="btnPause">暂停</button>
+        <button class="ghost" id="btnWeights">下载已确认权重</button>
+      </div>
+      <div class="hint">任一进程退出，整组自动暂停；恢复会开启新一代（generation），
+        两侧回滚到最后已确认轮后重做未确认轮，绝不跳轮、不重复应用。</div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>3 · 故障注入</h2>
+      <label>人工延迟（秒，注入到每个进程的梯度/提交/准备响应）</label>
+      <div class="row">
+        <input type="number" id="delay" value="0" min="0" max="120" step="0.5"
+               style="flex:1">
+        <button class="ghost" id="btnDelay">同时设置</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="danger" id="btnKill1">强杀 worker1（SIGKILL）</button>
+        <button class="danger" id="btnKill2">强杀 worker2（SIGKILL）</button>
+      </div>
+      <div class="hint">强杀后容器入口守护会重启进程；守护内旧 generation 消息将被拒绝（409）。</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>训练总览</h2>
+      <div class="kv">
+        <div class="k">任务状态</div><div><span class="pill idle" id="st">—</span></div>
+        <div class="k">训练代 generation</div><div id="gen">—</div>
+        <div class="k">已确认轮次</div><div id="confirmed">—</div>
+        <div class="k">最新损失（全数据 BCE）</div><div id="loss">—</div>
+        <div class="k">进行中轮次</div><div id="running">—</div>
+        <div class="k">最近事件</div><div id="event">—</div>
+        <div class="k">错误</div><div class="err" id="err" style="margin:0"></div>
+      </div>
+      <div class="grid2">
+        <div class="worker" id="w1box">
+          <h3>worker1（独立 CPU 进程）<span id="w1alive"></span></h3>
+          <div class="kv" id="w1kv"></div>
+        </div>
+        <div class="worker" id="w2box">
+          <h3>worker2（独立 CPU 进程）<span id="w2alive"></span></h3>
+          <div class="kv" id="w2kv"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>损失曲线（仅已确认轮）</h2>
+      <canvas id="chart" width="900" height="260"></canvas>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>轮次记录 / 事件日志</h2>
+      <div style="max-height:210px; overflow:auto; margin-bottom:12px">
+        <table id="lossTable"><thead><tr>
+          <th>轮次</th><th>损失 BCE</th><th>时间戳</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let lastEvent = "", pollTimer = null;
+
+async function api(path, opts={}) {
+  const r = await fetch(path, opts);
+  const txt = await r.text();
+  let data; try { data = txt ? JSON.parse(txt) : {}; }
+            catch(e){ data = {detail: txt}; }
+  if (!r.ok) throw new Error(data.detail || (r.status+" "+r.statusText));
+  return data;
+}
+function post(path, body){
+  const opt = {method:"POST"};
+  if (body) { opt.headers={"Content-Type":"application/json"};
+              opt.body = JSON.stringify(body); }
+  return api(path, opt);
+}
+function fmt(x, d=6){ return (x===null||x===undefined) ? "—" : Number(x).toFixed(d); }
+function ts(ms){ return new Date(ms).toLocaleTimeString(); }
+
+async function upload() {
+  const f = $("csv").files[0];
+  if (!f) { $("uploadErr").textContent = "请先选择 CSV 文件"; return; }
+  const rounds = parseInt($("rounds").value, 10);
+  if (!(rounds>=1 && rounds<=100)) {
+    $("uploadErr").textContent = "轮数必须在 1～100"; return;
+  }
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    $("uploadErr").textContent = "上传中…";
+    const d = await api(`/api/job?rounds=${rounds}`, {method:"POST", body:fd});
+    $("uploadErr").textContent = "";
+    pushLog(`任务已创建：n=${d.total_rounds ? "" : ""} task=${d.task_id.slice(0,8)} 轮数=${d.total_rounds}`);
+  } catch(e) { $("uploadErr").textContent = e.message; }
+}
+
+function workerBox(slot, h) {
+  const alive = h && h.alive;
+  $(slot+"alive").innerHTML =
+    `<span class="dot ${alive?"up":"down"}"></span>${alive?"存活":"不可达"}`;
+  $(slot+"kv").innerHTML = alive
+    ? `<div class="k">PID</div><div>${h.pid}</div>
+       <div class="k">持有任务</div><div>${(h.task_id||"—").slice(0,8)||"—"}</div>
+       <div class="k">当前 generation</div><div>${h.gen??"—"}</div>
+       <div class="k">已持久化轮次</div><div>${h.round}</div>
+       <div class="k">注入延迟</div><div>${h.delay_seconds}s</div>
+       <div class="k">进程存活时长</div><div>${h.uptime}s</div>`
+    : `<div class="k">状态</div><div class="err" style="margin:0">${
+        (h&&h.error)?h.error.slice(0,80):"进程未响应"}</div>`;
+}
+
+function drawChart(history) {
+  const c = $("chart"), ctx = c.getContext("2d");
+  const W=c.width, H=c.height, pad=42;
+  ctx.clearRect(0,0,W,H);
+  if (!history || history.length < 2) {
+    ctx.fillStyle="#5c6b88"; ctx.font="13px sans-serif";
+    ctx.fillText("等待已确认轮次数据…", pad, H/2); return;
+  }
+  const xs = history.map(h=>h.round), ys = history.map(h=>h.loss);
+  const xmin=Math.min(...xs), xmax=Math.max(...xs);
+  const ymin=Math.min(...ys), ymax=Math.max(...ys);
+  const X=x => pad + (x-xmin)/Math.max(1,xmax-xmin)*(W-pad*1.4);
+  const Y=y => H-pad - (y-ymin)/Math.max(1e-12,ymax-ymin)*(H-pad*1.8);
+  ctx.strokeStyle="#2a3550"; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad,10); ctx.lineTo(pad,H-pad);
+  ctx.lineTo(W-pad*0.4,H-pad); ctx.stroke();
+  ctx.fillStyle="#8fa0bd"; ctx.font="11px sans-serif";
+  ctx.fillText(fmt(ymax,4), 4, 16); ctx.fillText(fmt(ymin,4), 4, H-pad);
+  ctx.fillText(String(xmin), pad-4, H-pad+16);
+  ctx.fillText(String(xmax), W-pad*0.4-10, H-pad+16);
+  ctx.strokeStyle="#5b8cff"; ctx.lineWidth=2; ctx.beginPath();
+  history.forEach((h,i)=>{ i?ctx.lineTo(X(h.round),Y(h.loss))
+                              :ctx.moveTo(X(h.round),Y(h.loss)); });
+  ctx.stroke();
+  ctx.fillStyle="#9cc2ff";
+  history.forEach(h=>{ ctx.beginPath();
+    ctx.arc(X(h.round),Y(h.loss),3,0,Math.PI*2); ctx.fill(); });
+}
+
+function render(d) {
+  const st = d.status || "idle";
+  const el = $("st"); el.textContent = st; el.className = "pill "+st;
+  $("gen").textContent = d.gen ?? "—";
+  $("confirmed").textContent =
+    `${d.confirmed_round ?? "—"} / ${d.total_rounds ?? "—"}`;
+  const last = (d.loss_history||[]).slice(-1)[0];
+  $("loss").textContent = last ? fmt(last.loss) : "—";
+  $("running").textContent = d.running_round ?? "—";
+  $("event").textContent = d.last_event ?? "—";
+  $("err").textContent = d.last_error ?? "";
+  workerBox("w1", d.workers && d.workers.worker1);
+  workerBox("w2", d.workers && d.workers.worker2);
+  drawChart(d.loss_history);
+  const tb = $("lossTable").querySelector("tbody");
+  tb.innerHTML = (d.loss_history||[]).map(h =>
+    `<tr><td>${h.round}</td><td>${fmt(h.loss)}</td><td>${ts(h.at)}</td></tr>`
+  ).join("");
+  if (d.last_event && d.last_event !== lastEvent) {
+    pushLog(`[${st}] ${d.last_event}`);
+    if (d.last_error) pushLog("ERROR: " + d.last_error);
+    lastEvent = d.last_event;
+  }
+  const busy = st === "running" || st === "preparing";
+  ["btnStart","btnResume"].forEach(b=>$(b).disabled = busy);
+}
+
+function pushLog(line) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent += `${t}  ${line}\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+async function poll() {
+  try { render(await api("/api/status")); }
+  catch(e){ pushLog("status 轮询失败: " + e.message); }
+}
+
+$("btnUpload").onclick = upload;
+$("btnStart").onclick = async()=>{ try{ await post("/api/start"); }
+  catch(e){ pushLog("启动失败: "+e.message); } poll(); };
+$("btnResume").onclick = async()=>{ try{ await post("/api/resume");
+  pushLog("已请求恢复：新 generation，回滚到最后确认轮后继续"); }
+  catch(e){ pushLog("恢复失败: "+e.message); } poll(); };
+$("btnPause").onclick = async()=>{ try{ await post("/api/pause"); }
+  catch(e){ pushLog("暂停失败: "+e.message); } poll(); };
+$("btnReset").onclick = async()=>{
+  if(!confirm("清除当前任务及其状态？")) return;
+  try{ await post("/api/reset"); location.reload(); }
+  catch(e){ pushLog("重置失败: "+e.message); } };
+$("btnWeights").onclick = ()=>{ window.location = "/api/weights"; };
+$("btnDelay").onclick = async()=>{
+  const s = parseFloat($("delay").value)||0;
+  try{ await post("/api/workers/delay", {seconds:s});
+       pushLog(`两进程延迟已设为 ${s}s`); }
+  catch(e){ pushLog("延迟设置失败: "+e.message); } };
+$("btnKill1").onclick = async()=>{ await post("/api/workers/worker1/kill");
+  pushLog("已强杀 worker1（SIGKILL）"); poll(); };
+$("btnKill2").onclick = async()=>{ await post("/api/workers/worker2/kill");
+  pushLog("已强杀 worker2（SIGKILL）"); poll(); };
+
+poll();
+pollTimer = setInterval(poll, 1200);
+</script>
+</body>
+</html>
